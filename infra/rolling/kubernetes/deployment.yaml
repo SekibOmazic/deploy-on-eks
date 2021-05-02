@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: <API_NAME>
+  labels:
+    app: <API_NAME>
+  namespace: default
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: <API_NAME>
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: <API_NAME>
+    spec:
+      containers:
+        - image: <IMAGE_URI>
+          imagePullPolicy: Always
+          name: <API_NAME>
+          ports:
+            - containerPort: 80
+              protocol: TCP

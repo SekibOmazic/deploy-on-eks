@@ -1,0 +1,12 @@
+# service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: color-service
+spec:
+  selector:
+    app: <API_NAME>
+  ports:
+  - port: 80
+    targetPort: 80
+  type: LoadBalancer
