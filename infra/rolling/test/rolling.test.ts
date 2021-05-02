@@ -23,6 +23,8 @@ test('Pipeline Created', () => {
     },
     githubRepoName: 'deploy-on-eks',
     githubRepoOwner: 'SekibOmazic',
+    dockerHubUsername: 'mock-username',
+    dockerHubPassword: 'mock-password',
   })
   // THEN
   expectCDK(stack).to(countResources('AWS::CodePipeline::Pipeline', 1))

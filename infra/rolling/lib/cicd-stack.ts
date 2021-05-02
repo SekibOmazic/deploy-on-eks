@@ -5,6 +5,7 @@ import * as codepipeline_actions from '@aws-cdk/aws-codepipeline-actions'
 import * as ecr from '@aws-cdk/aws-ecr'
 import * as iam from '@aws-cdk/aws-iam'
 import * as eks from '@aws-cdk/aws-eks'
+import * as secretsManager from '@aws-cdk/aws-secretsmanager'
 
 export interface CicdProps extends cdk.StackProps {
   readonly cluster: eks.Cluster
@@ -12,6 +13,8 @@ export interface CicdProps extends cdk.StackProps {
   readonly githubRepoName: string
   readonly githubRepoOwner: string
   readonly apiName: string
+  readonly dockerHubUsername: string
+  readonly dockerHubPassword: string
 }
 
 export class CicdStack extends cdk.Stack {
@@ -24,6 +27,19 @@ export class CicdStack extends cdk.Stack {
       repositoryName: props.githubRepoName,
       imageScanOnPush: true,
     })
+
+    // secrets manager for DockerHub login
+    const dockerHubSecret = new secretsManager.CfnSecret(
+      this,
+      'dockerHubSecret',
+      {
+        secretString: JSON.stringify({
+          username: props.dockerHubUsername,
+          password: props.dockerHubPassword,
+        }),
+        description: 'DockerHub secrets for CodeBuild',
+      }
+    )
 
     // SOURCE
     const githubAccessToken = cdk.SecretValue.secretsManager(
@@ -47,7 +63,13 @@ export class CicdStack extends cdk.Stack {
     // BUILD
     const buildOutput = new codepipeline.Artifact('BuildArtifact')
 
-    const buildProject = createBuildProject(this, ecrRepo, props.env!.account!)
+    const buildProject = createBuildProject(
+      this,
+      ecrRepo,
+      props.env!.account!,
+      props.apiName,
+      dockerHubSecret
+    )
 
     const buildAction = new codepipeline_actions.CodeBuildAction({
       actionName: 'CodeBuild',
@@ -62,7 +84,7 @@ export class CicdStack extends cdk.Stack {
     const deployOutput = new codepipeline.Artifact('DeployArtifact')
     const deployProject = createDeployProject(
       this,
-      imageUri,
+      ecrRepo,
       props.apiName,
       props.env!.account!,
       props.cluster.clusterName,
@@ -71,7 +93,7 @@ export class CicdStack extends cdk.Stack {
     const deployAction = new codepipeline_actions.CodeBuildAction({
       actionName: 'CodeBuild-DeployOnEks',
       project: deployProject,
-      input: buildOutput,
+      input: sourceOutput,
       outputs: [deployOutput],
     })
 
@@ -99,7 +121,9 @@ export class CicdStack extends cdk.Stack {
 const createBuildProject = (
   scope: cdk.Construct,
   ecrRepo: ecr.Repository,
-  accountId: string
+  accountId: string,
+  apiName: string,
+  dockerHubSecret: secretsManager.CfnSecret
 ): codebuild.PipelineProject => {
   const buildProject = new codebuild.PipelineProject(scope, 'CodeBuildEks', {
     description: 'Code build project for the application',
@@ -116,12 +140,24 @@ const createBuildProject = (
           value: accountId,
           type: codebuild.BuildEnvironmentVariableType.PLAINTEXT,
         },
+        API_NAME: {
+          value: apiName,
+          type: codebuild.BuildEnvironmentVariableType.PLAINTEXT,
+        },
+        DOCKER_HUB_SECRET_ARN: {
+          value: dockerHubSecret.ref,
+          type: codebuild.BuildEnvironmentVariableType.PLAINTEXT,
+        },
       },
     },
     buildSpec: codebuild.BuildSpec.fromObject({
       version: '0.2',
       env: {
         'exported-variables': ['IMAGE_TAG'],
+        'secrets-manager': {
+          DOCKER_HUB_USERNAME: '$DOCKER_HUB_SECRET_ARN:username',
+          DOCKER_HUB_PASSWORD: '$DOCKER_HUB_SECRET_ARN:password',
+        },
       },
       phases: {
         install: {
@@ -133,12 +169,15 @@ const createBuildProject = (
         pre_build: {
           commands: [
             'env',
+            'echo Logging in to DockerHub ...',
+            'docker login --username $DOCKER_HUB_USERNAME --password $DOCKER_HUB_PASSWORD',
             'echo Logging in to Amazon ECR...',
             'aws --version',
             'ECR_REPO=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com',
             'aws ecr get-login-password | docker login --username AWS --password-stdin $ECR_REPO',
             'COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)',
             'TAG=${COMMIT_HASH:=latest}',
+            'export IMAGE_TAG=$TAG',
           ],
         },
         build: {
@@ -156,15 +195,19 @@ const createBuildProject = (
             'echo Pushing the Docker images...',
             'docker push $ECR_REPOSITORY_URI:latest',
             'docker push $ECR_REPOSITORY_URI:$TAG',
-            'export IMAGE_TAG=$TAG',
+            'printf "[{"name":"${API_NAME}","imageUri":"${ECR_REPOSITORY_URI}:$TAG"}]" > imagedefinitions.json',
+            'cat imagedefinitions.json',
           ],
         },
+      },
+      artifacts: {
+        files: ['**/*'],
       },
     }),
   })
   buildProject.addToRolePolicy(
     new iam.PolicyStatement({
-      actions: ['ecr:GetAuthorizationToken'],
+      actions: ['ecr:GetAuthorizationToken', 'secretsmanager:GetSecretValue'],
       resources: ['*'],
     })
   )
@@ -188,7 +231,7 @@ const createBuildProject = (
 
 const createDeployProject = (
   scope: cdk.Construct,
-  imageUri: string,
+  ecrRepo: ecr.Repository,
   apiName: string,
   accountId: string,
   clusterName: string,
@@ -201,8 +244,8 @@ const createDeployProject = (
       computeType: codebuild.ComputeType.SMALL,
       privileged: true,
       environmentVariables: {
-        IMAGE_URI: {
-          value: imageUri,
+        ECR_REPOSITORY_URI: {
+          value: ecrRepo.repositoryUri,
           type: codebuild.BuildEnvironmentVariableType.PLAINTEXT,
         },
         AWS_ACCOUNT_ID: {
@@ -217,6 +260,10 @@ const createDeployProject = (
           value: clusterName,
           type: codebuild.BuildEnvironmentVariableType.PLAINTEXT,
         },
+        DEPLOYMENT_ROLE_ARN: {
+          value: roleToAssume.roleArn,
+          type: codebuild.BuildEnvironmentVariableType.PLAINTEXT,
+        },
       },
     },
     buildSpec: codebuild.BuildSpec.fromObject({
@@ -227,27 +274,32 @@ const createDeployProject = (
             docker: 18,
           },
           commands: [
+            'echo Installing kubectl ...',
             'curl -o kubectl https://amazon-eks.s3.us-west-2.amazonaws.com/1.19.6/2021-01-05/bin/linux/amd64/kubectl',
             'chmod +x ./kubectl',
             'mv ./kubectl /usr/local/bin/kubectl',
             'mkdir ~/.kube',
-            'aws eks --region ${AWS_REGION} update-kubeconfig --name $CLUSTER_NAME',
+            'aws eks update-kubeconfig --region ${AWS_REGION} --name $CLUSTER_NAME --role-arn $DEPLOYMENT_ROLE_ARN',
           ],
         },
         build: {
           commands: [
             'echo Build started on `date`',
+            'COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)',
+            'echo COMMIT_HASH=$COMMIT_HASH',
+            'IMAGE_URI=$ECR_REPOSITORY_URI:$COMMIT_HASH',
+            'echo $IMAGE_URI',
             'echo Updating yaml configs ...',
             `sed -i 's@<API_NAME>@'$API_NAME'@g' infra/rolling/kubernetes/service.yaml`,
-            `sed -i 's@<API_NAME>@'$API_NAME'@g' infra/rolling/kubernetes/deploy.yaml`,
-            `sed -i 's@<IMAGE_URI>@'$IMAGE_URI'@g' infra/rolling/kubernetes/deploy.yaml`,
-            'cat infra/rolling/kubernetes/deploy.yaml',
+            `sed -i 's@<API_NAME>@'$API_NAME'@g' infra/rolling/kubernetes/deployment.yaml`,
+            `sed -i 's@<IMAGE_URI>@'$IMAGE_URI'@g' infra/rolling/kubernetes/deployment.yaml`,
+            'cat infra/rolling/kubernetes/deployment.yaml',
           ],
         },
         post_build: {
           commands: [
             'echo Updating EKS deployment ...',
-            'kubectl apply -f infra/rolling/kubernetes/deploy.yaml',
+            'kubectl apply -f infra/rolling/kubernetes/deployment.yaml',
             'kubectl apply -f infra/rolling/kubernetes/service.yaml',
           ],
         },
